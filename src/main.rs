@@ -1,5 +1,4 @@
 use clap::Parser;
-use env_logger;
 use log::{debug, error, info, trace, warn};
 use std::collections::HashMap;
 use std::error::Error;
@@ -130,8 +129,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for AppData {
                         }
                         None => {
                             // vec doesn't exist -> first monitor, index is 0
-                            let mut new_vec = Vec::new();
-                            new_vec.push(proxy.bind(name, version, queue_handle, 0));
+                            let new_vec = vec![proxy.bind(name, version, queue_handle, 0)];
                             state.outputs = Some(new_vec);
                         }
                     }
@@ -268,7 +266,7 @@ impl Dispatch<wl_output::WlOutput, usize> for AppData {
                     return;
                 };
                 // create an xdg_output object for this wl_output
-                xdg_output_manager.get_xdg_output(proxy, &queue_handle, *data as i64);
+                xdg_output_manager.get_xdg_output(proxy, queue_handle, *data as i64);
 
                 // create a surface for this output & store it
                 let Some((compositor, _)) = &state.compositor else {
@@ -278,7 +276,7 @@ impl Dispatch<wl_output::WlOutput, usize> for AppData {
                 vec_insert(
                     &mut state.surfaces,
                     *data as i64,
-                    compositor.create_surface(&queue_handle, ()),
+                    compositor.create_surface(queue_handle, ()),
                 );
             }
             _ => {}
@@ -319,6 +317,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for AppData {
         _connection: &wayland_client::Connection,
         _queue_handle: &wayland_client::QueueHandle<Self>,
     ) {
+        #[allow(clippy::single_match)]
         match event {
             wl_pointer::Event::Button {
                 state: button_state,
@@ -583,12 +582,12 @@ impl Dispatch<ZwlrScreencopyFrameV1, i64> for AppData {
                     height as i32,
                     stride as i32,
                     format.into_result().expect("Unsupported format"),
-                    &queue_handle,
+                    queue_handle,
                     (),
                 );
                 vec_insert(&mut state.buffers, *data, buffer);
             }
-            zwlr_screencopy_frame_v1::Event::BufferDone { .. } => {
+            zwlr_screencopy_frame_v1::Event::BufferDone => {
                 debug!(
                     "| Received zwlr_screencopy_frame_v1::Event::BufferDone for output {}",
                     data
@@ -646,6 +645,7 @@ impl Dispatch<ZxdgOutputV1, i64> for AppData {
         _connection: &wayland_client::Connection,
         _queue_handle: &wayland_client::QueueHandle<Self>,
     ) {
+        #[allow(clippy::single_match)]
         match event {
             zxdg_output_v1::Event::LogicalSize { width, height } => {
                 // describes the size of the output in the global compositor space
@@ -686,6 +686,7 @@ impl Dispatch<WpFractionalScaleV1, i64> for AppData {
         _connection: &wayland_client::Connection,
         _queue_handle: &wayland_client::QueueHandle<Self>,
     ) {
+        #[allow(clippy::single_match)]
         match event {
             wp_fractional_scale_v1::Event::PreferredScale { scale } => {
                 // notifies of a new preferred scale for this surface
@@ -738,7 +739,7 @@ impl Dispatch<WpFractionalScaleV1, i64> for AppData {
 
                 // set source & destination rectangle
                 viewports[data].set_source(-1.0, -1.0, -1.0, -1.0);
-                viewports[data].set_destination(widths[data] as i32, heights[data] as i32);
+                viewports[data].set_destination(widths[data], heights[data]);
                 // update layer surface size every time the preferred scale changes
                 layer_surfaces[data].set_size(widths[data] as u32, heights[data] as u32);
                 surfaces[data].commit();
@@ -795,12 +796,14 @@ impl ScreenFreezer {
         let queue_handle = event_queue.handle();
         let display = connection.display();
         let _registry = display.get_registry(&queue_handle, ());
-        let mut state = AppData::default();
-        state.hide_cursor = hide_cursor;
-        state.before_cmd = before_cmd;
-        state.after_cmd = after_cmd;
-        state.before_timeout = before_timeout;
-        state.after_timeout = after_timeout;
+        let mut state = AppData {
+            hide_cursor,
+            before_cmd,
+            after_cmd,
+            before_timeout,
+            after_timeout,
+            ..Default::default()
+        };
 
         event_queue.roundtrip(&mut state).unwrap();
         info!("> Received all globals");
@@ -835,7 +838,7 @@ impl ScreenFreezer {
 
         loop {
             self.event_queue.blocking_dispatch(&mut self.state).unwrap();
-            if self.state.outputs_ready == self.state.output_count as i32 {
+            if self.state.outputs_ready == self.state.output_count {
                 break;
             }
         }
@@ -870,14 +873,15 @@ impl ScreenFreezer {
                 return Ok(());
             };
             // create pool
-            let tmp = tempfile().ok().expect("Unable to create tempfile");
+            let tmp = tempfile().expect("Unable to create tempfile");
             let pool_size = phys_heights[&i] * phys_widths[&i] * 4; // height * width * 4 -> total size of the pool
             tmp.set_len(pool_size as u64).unwrap();
             let pool: wl_shm_pool::WlShmPool =
-                wl_shm::WlShm::create_pool(&shm, tmp.as_fd(), pool_size, &self.queue_handle, ());
+                wl_shm::WlShm::create_pool(shm, tmp.as_fd(), pool_size, &self.queue_handle, ());
 
             trace!("  capturing output {}", i);
             // create screencopyframe from output
+
             let screencopy_frame = screencopy_manager.capture_output(
                 !self.state.hide_cursor as i32,
                 &outputs[i as usize],
@@ -892,8 +896,8 @@ impl ScreenFreezer {
         // wait for all frames to be copied & run before-freeze commands
         loop {
             self.event_queue.blocking_dispatch(&mut self.state).unwrap();
-            if self.state.frames_ready == self.state.output_count as i32 {
-                if &self.state.before_cmd != "" {
+            if self.state.frames_ready == self.state.output_count {
+                if self.state.before_cmd.is_empty() {
                     info!(
                         "> Running before-freeze commands: {}",
                         &self.state.before_cmd
@@ -902,7 +906,8 @@ impl ScreenFreezer {
                         .arg("-c")
                         .arg(&self.state.before_cmd)
                         .spawn()
-                        .expect("Failed to run before-freeze commands");
+                        .expect("Failed to run before-freeze commands")
+                        .wait()?;
                     sleep(Duration::from_millis(self.state.before_timeout));
                 }
                 break;
@@ -934,7 +939,7 @@ impl ScreenFreezer {
             let ls = zwlr_layer_shell_v1::ZwlrLayerShellV1::get_layer_surface(
                 layer_shell,
                 &surfaces[&i],
-                Some(&output),
+                Some(output),
                 Layer::Overlay,
                 "wayfreeze".to_string(),
                 &self.queue_handle,
@@ -981,14 +986,15 @@ impl ScreenFreezer {
         }
         info!("> Screen frozen");
 
-        if &self.state.after_cmd != "" {
+        if self.state.after_cmd.is_empty() {
             sleep(Duration::from_millis(self.state.after_timeout));
             info!("> Running after-freeze commands: {}", &self.state.after_cmd);
             Command::new("sh")
                 .arg("-c")
                 .arg(&self.state.after_cmd)
                 .spawn()
-                .expect("Failed to run after-freeze commands");
+                .expect("Failed to run after-freeze commands")
+                .wait()?;
         }
 
         loop {
